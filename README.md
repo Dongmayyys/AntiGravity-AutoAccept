@@ -98,7 +98,7 @@ alias antigravity='antigravity --remote-debugging-port=9333'
 **Manual:**
 1. Copy the `src/` directory, `package.json`, and `package-lock.json` to:
    ```
-   ~/.antigravity/extensions/YazanBaker.antigravity-autoaccept-3.2.0/
+   ~/.antigravity/extensions/YazanBaker.antigravity-autoaccept-3.3.0/
    ```
 2. Run `npm install` in that directory (installs `ws` dependency)
 3. Reload Window
@@ -125,14 +125,14 @@ To run multiple agents simultaneously and have the bot auto-click commands for a
 
 ## Settings
 
-| Setting | Default | Description |
-|---|---|---|
-| `autoAcceptV2.pollInterval` | `500` | Polling interval in ms |
-| `autoAcceptV2.customButtonTexts` | `[]` | Extra button texts for i18n or custom prompts |
-| `autoAcceptV2.cdpPort` | `9333` | CDP port (default avoids conflict with AG Browser Control on 9222) |
-| `autoAcceptV2.autoAcceptFileEdits` | `true` | Auto-accept file edit changes (disable to review diffs manually) |
-| `autoAcceptV2.blockedCommands` | `[]` | Commands to NEVER auto-run (e.g. `rm`, `git push`, `npm publish`) |
-| `autoAcceptV2.allowedCommands` | `[]` | If set, ONLY these commands will auto-run (whitelist mode) |
+| Setting | Default | Scope | Description |
+|---|---|---|---|
+| `autoAcceptV2.pollInterval` | `500` | window | Polling interval in ms |
+| `autoAcceptV2.customButtonTexts` | `[]` | application | Extra button texts for i18n or custom prompts |
+| `autoAcceptV2.cdpPort` | `9333` | machine | CDP port (default avoids conflict with AG Browser Control on 9222) |
+| `autoAcceptV2.autoAcceptFileEdits` | `true` | window | Auto-accept file edit changes (disable to review diffs manually) |
+| `autoAcceptV2.blockedCommands` | `[]` | application | Commands to NEVER auto-run (e.g. `rm`, `git push`, `npm publish`) |
+| `autoAcceptV2.allowedCommands` | `[]` | application | If set, ONLY these commands will auto-run (whitelist mode) |
 
 > **Tip:** Settings are hot-reloaded — changes take effect immediately without restarting.
 

@@ -120,7 +120,7 @@ class DashboardProvider {
                 vscode.commands.executeCommand('autoAcceptV2.toggle');
                 break;
             case 'updateConfig': {
-                await config.update(msg.key, msg.value);
+                await config.update(msg.key, msg.value, vscode.ConfigurationTarget.Global);
                 this._pushState();
                 break;
             }
@@ -128,14 +128,14 @@ class DashboardProvider {
                 const list = [...config.get('blockedCommands', [])];
                 if (msg.value && !list.includes(msg.value)) {
                     list.push(msg.value);
-                    await config.update('blockedCommands', list);
+                    await config.update('blockedCommands', list, vscode.ConfigurationTarget.Global);
                 }
                 this._pushState();
                 break;
             }
             case 'removeBlocked': {
                 const list = config.get('blockedCommands', []).filter(c => c !== msg.value);
-                await config.update('blockedCommands', list);
+                await config.update('blockedCommands', list, vscode.ConfigurationTarget.Global);
                 this._pushState();
                 break;
             }
@@ -143,14 +143,14 @@ class DashboardProvider {
                 const list = [...config.get('allowedCommands', [])];
                 if (msg.value && !list.includes(msg.value)) {
                     list.push(msg.value);
-                    await config.update('allowedCommands', list);
+                    await config.update('allowedCommands', list, vscode.ConfigurationTarget.Global);
                 }
                 this._pushState();
                 break;
             }
             case 'removeAllowed': {
                 const list = config.get('allowedCommands', []).filter(c => c !== msg.value);
-                await config.update('allowedCommands', list);
+                await config.update('allowedCommands', list, vscode.ConfigurationTarget.Global);
                 this._pushState();
                 break;
             }
