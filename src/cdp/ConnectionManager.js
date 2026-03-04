@@ -39,6 +39,7 @@ class ConnectionManager {
         this.reconnectTimer = null;
         this.heartbeatTimer = null;
         this.onStatusChange = null; // Callback when CDP status changes
+        this.onClickTelemetry = null; // Callback with click delta for analytics
         this._sessionFailCounts = new Map(); // Consecutive heartbeat failures per targetId
     }
 
@@ -82,8 +83,8 @@ class ConnectionManager {
      */
     reinjectAll() {
         if (!this.ws || this.sessions.size === 0) return;
-        // Reset idempotency flags so re-injection proceeds
-        const resetExpr = 'window.__AA_OBSERVER_ACTIVE = false; "reset"';
+        // Call __AA_CLEANUP + reset idempotency flag so re-injection proceeds cleanly
+        const resetExpr = 'if (typeof window.__AA_CLEANUP === "function") window.__AA_CLEANUP(); window.__AA_OBSERVER_ACTIVE = false; "reset"';
         for (const [targetId, sessionId] of this.sessions) {
             this._send('Runtime.evaluate', { expression: resetExpr }, sessionId)
                 .then(() => this._injectObserver(sessionId))
@@ -149,13 +150,11 @@ class ConnectionManager {
      */
     unpause() {
         this.isPaused = false;
-        const unpauseExpr = 'window.__AA_PAUSED = false; "unpaused"';
-        for (const [targetId, sessionId] of this.sessions) {
-            this._send('Runtime.evaluate', { expression: unpauseExpr }, sessionId)
-                .then(() => this.log(`[CDP] Unpaused session ${targetId.substring(0, 6)}`))
-                .catch(e => this.log(`[CDP] Unpause failed for ${targetId.substring(0, 6)}: ${e.message}`));
-        }
-        this.log('[CDP] All sessions unpaused');
+        // Nuclear unpause: re-inject all observers to guarantee pristine, known-good state.
+        // This ensures that even if the observer was silently disconnected during the pause,
+        // the system deterministically re-establishes all bindings.
+        this.reinjectAll();
+        this.log('[CDP] All sessions unpaused + re-injected');
         if (this.onStatusChange) this.onStatusChange();
     }
 
@@ -299,17 +298,22 @@ class ConnectionManager {
 
     _onClose() {
         this.log('[CDP] Connection closed');
-        this.ws = null;
-        this.sessions.clear();
-        this.ignoredTargets.clear(); // Reset on reconnect — targets may have changed
-        this._sessionFailCounts.clear();
-        this._clearPending();
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
-        if (this.onStatusChange) this.onStatusChange();
-
-        if (this.isRunning) {
-            this._scheduleReconnect();
+        try {
+            this.ws = null;
+            this.sessions.clear();
+            this.ignoredTargets.clear();
+            this._sessionFailCounts.clear();
+            this._clearPending();
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+            if (this.onStatusChange) this.onStatusChange();
+        } catch (e) {
+            this.log(`[CDP] Teardown error (non-fatal): ${e.message}`);
+        } finally {
+            // Guarantee reconnection regardless of teardown exceptions
+            if (this.isRunning) {
+                this._scheduleReconnect();
+            }
         }
     }
 
@@ -550,10 +554,14 @@ class ConnectionManager {
             const sessionEntries = [...this.sessions.entries()];
             const healthResults = await Promise.allSettled(
                 sessionEntries.map(async ([targetId, sessionId]) => {
+                    // Atomic consume-and-reset: IIFE reads click count AND resets to 0
+                    // in a single JS turn (thread-safe). Eliminates page-reload data loss.
                     const check = await this._send('Runtime.evaluate', {
-                        expression: '!!window.__AA_OBSERVER_ACTIVE'
+                        expression: '(() => { const c = window.__AA_CLICK_COUNT || 0; window.__AA_CLICK_COUNT = 0; return { alive: !!window.__AA_PAUSED || (!!window.__AA_OBSERVER_ACTIVE && (Date.now() - (window.__AA_LAST_SCAN || 0)) < 120000), clickCount: c }; })()',
+                        returnByValue: true
                     }, sessionId);
-                    return { targetId, sessionId, alive: check.result?.result?.value === true };
+                    const health = check.result?.result?.value || { alive: false, clickCount: 0 };
+                    return { targetId, sessionId, alive: health.alive, clickCount: health.clickCount };
                 })
             );
 
@@ -567,6 +575,11 @@ class ConnectionManager {
                 if (status === 'fulfilled') {
                     // Reset consecutive fail counter on any successful communication
                     this._sessionFailCounts.delete(targetId);
+
+                    // Harvest click telemetry from consume-and-reset
+                    if (this.onClickTelemetry && value.clickCount > 0) {
+                        this.onClickTelemetry(value.clickCount);
+                    }
 
                     if (!value.alive) {
                         this.log(`[CDP] Session [${shortId}] observer dead, re-injecting...`);

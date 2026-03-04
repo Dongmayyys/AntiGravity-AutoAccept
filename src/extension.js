@@ -27,6 +27,20 @@ const TERMINAL_COMMANDS = [
     'antigravity.terminalCommand.run',
 ];
 
+// Conservative estimate: each manual click = review + find button + click ≈ 3s
+const SECONDS_SAVED_PER_CLICK = 3;
+
+// Milestones + gamification ranks (single source of truth — shared with dashboard)
+const MILESTONES = [100, 500, 1000, 5000, 10000, 50000];
+const MILESTONE_RANKS = {
+    100: 'Initiate',
+    500: 'Apprentice',
+    1000: 'Automator',
+    5000: 'Time Lord',
+    10000: 'Grandmaster',
+    50000: 'Ascended'
+};
+
 /**
  * Cached configuration state — refreshed via onDidChangeConfiguration,
  * never read from registry on every poll tick (avoids I/O spam).
@@ -126,20 +140,35 @@ function startPolling() {
     const activeCommands = getActiveCommands();
     log(`Polling started (every ${interval}ms, ${activeCommands.length} commands)`);
 
+    let consecutiveErrors = 0;
     // Recursive setTimeout pattern — guarantees strict sequential execution.
     async function pollCycle() {
         if (!isEnabled) return;
-        // Re-read active commands each cycle so config changes take effect live
-        const cmds = getActiveCommands();
         try {
+            // Re-read active commands each cycle so config changes take effect live.
+            // Inside try/catch: if getActiveCommands throws (e.g. extension host crash),
+            // the setTimeout chain still survives instead of silently dying.
+            const cmds = getActiveCommands();
             const timeoutPromise = new Promise(resolve => setTimeout(resolve, 3000));
             const commandsPromise = Promise.allSettled(
                 cmds.map(cmd => vscode.commands.executeCommand(cmd))
             );
             await Promise.race([commandsPromise, timeoutPromise]);
-        } catch (e) { /* silent */ }
+            consecutiveErrors = 0; // Reset on success
+        } catch (e) {
+            consecutiveErrors++;
+            if (consecutiveErrors <= 3 || consecutiveErrors % 10 === 0) {
+                log(`[Poll] Error (${consecutiveErrors}x): ${e.message}`);
+            }
+        }
         if (isEnabled) {
-            pollIntervalId = setTimeout(pollCycle, interval);
+            // Exponential backoff with ±20% jitter on persistent failures (caps at 30s).
+            // Jitter desynchronizes multiple workspace instances after host recovery.
+            const jitter = 0.8 + (Math.random() * 0.4);
+            const backoff = consecutiveErrors > 0
+                ? Math.min(interval * Math.pow(2, consecutiveErrors - 1), 30000) * jitter
+                : interval;
+            pollIntervalId = setTimeout(pollCycle, backoff);
         }
     }
     pollIntervalId = setTimeout(pollCycle, interval);
@@ -325,6 +354,67 @@ function activate(context) {
         if (dashboardProvider) dashboardProvider.refresh();
     };
 
+    // Date initialization uses a session flag to avoid repeated globalState reads.
+    // Cannot use prevTotal===0 guard — legacy users upgrading have clicks but no date.
+    let isDateInitialized = false;
+    connectionManager.onClickTelemetry = (delta) => {
+        // Guard: reject non-numeric, NaN, or zero delta to prevent state corruption
+        if (typeof delta !== 'number' || isNaN(delta) || delta <= 0) return;
+        const prevTotal = context.globalState.get('autoAcceptTotalClicks', 0);
+        const newTotal = prevTotal + delta;
+        context.globalState.update('autoAcceptTotalClicks', newTotal);
+        // Catches both new users AND legacy upgrades on their next click.
+        // Zero globalState I/O overhead after the first heartbeat.
+        if (!isDateInitialized) {
+            if (!context.globalState.get('autoAcceptFirstClickDate')) {
+                let startDateMs = Date.now();
+                // Synthetic Backdating for Legacy Upgrades:
+                // If user has historical clicks but no date, estimate start based on
+                // a conservative 250 clicks/week to normalize ROI and honor history.
+                if (prevTotal > 0) {
+                    const ASSUMED_CLICKS_PER_WEEK = 250;
+                    const assumedWeeks = prevTotal / ASSUMED_CLICKS_PER_WEEK;
+                    startDateMs -= assumedWeeks * 604800000; // weeks to ms
+                }
+                context.globalState.update('autoAcceptFirstClickDate', new Date(startDateMs).toISOString());
+            }
+            isDateInitialized = true;
+        }
+        // Milestone detection — descending order catches highest milestone on leaps
+        for (let i = MILESTONES.length - 1; i >= 0; i--) {
+            const m = MILESTONES[i];
+            if (prevTotal < m && newTotal >= m) {
+                if (dashboardProvider) dashboardProvider.refresh();
+                const rank = MILESTONE_RANKS[m] || '';
+                const minsSaved = Math.round((newTotal * SECONDS_SAVED_PER_CLICK) / 60);
+                const dollarsSaved = minsSaved; // $1/min conservative
+                const hh = Math.floor(minsSaved / 60);
+                const mm = minsSaved % 60;
+                const timeStr = minsSaved >= 60 ? (mm === 0 ? hh + 'h' : hh + 'h ' + mm + 'm') : minsSaved + ' mins';
+                log(`[Analytics] 🎉 Milestone: ${newTotal.toLocaleString()} clicks! Rank: ${rank}`);
+                // One-time celebration notification with dynamic metrics
+                vscode.window.showInformationMessage(
+                    `\u{1F3C6} ${rank}! You have auto-accepted ${m.toLocaleString()} times, saving ${timeStr} (~$${dollarsSaved}) of manual effort.`,
+                    'Support the Dev \u2615',
+                    'Share on X'
+                ).then(action => {
+                    if (action === 'Support the Dev \u2615') {
+                        vscode.env.openExternal(vscode.Uri.parse('https://github.com/yazanbaker94/AntiGravity-AutoAccept'));
+                    } else if (action === 'Share on X') {
+                        const tweet = `I just hit ${m.toLocaleString()} auto-clicks with AntiGravity AutoAccept! Rank: ${rank}. Saved ${timeStr} of dev time. Try it: https://github.com/yazanbaker94/AntiGravity-AutoAccept`;
+                        vscode.env.openExternal(vscode.Uri.parse(`https://twitter.com/intent/tweet?text=${encodeURIComponent(tweet)}`));
+                    }
+                });
+                break;
+            }
+        }
+    };
+
+    // Cross-machine sync: persist analytics across VS Code environments
+    context.globalState.setKeysForSync([
+        'autoAcceptTotalClicks', 'autoAcceptFirstClickDate', 'autoAcceptLastDismissedMilestone'
+    ]);
+
     // Initialize cached config state
     refreshConfig();
 
@@ -338,18 +428,40 @@ function activate(context) {
         })
     );
 
+    // Compute currentMilestone in host (single source of truth — no duplicate array in webview)
+    const _computeMilestone = (clicks) => {
+        for (let i = MILESTONES.length - 1; i >= 0; i--) {
+            if (clicks >= MILESTONES[i]) return MILESTONES[i];
+        }
+        return 0;
+    };
+
     // Dashboard provider
-    dashboardProvider = new DashboardProvider(context, log, () => ({
-        isEnabled,
-        cdpConnected: connectionManager ? !!connectionManager.ws : false,
-        sessionCount: connectionManager ? connectionManager.sessions.size : 0
-    }));
+    dashboardProvider = new DashboardProvider(context, log, () => {
+        const totalClicks = context.globalState.get('autoAcceptTotalClicks', 0);
+        const currentMilestone = _computeMilestone(totalClicks);
+        const nextM = MILESTONES.find(m => m > totalClicks);
+        return {
+            isEnabled,
+            cdpConnected: connectionManager ? !!connectionManager.ws : false,
+            sessionCount: connectionManager ? connectionManager.sessions.size : 0,
+            totalClicks,
+            timeSavedMinutes: Math.round((totalClicks * SECONDS_SAVED_PER_CLICK) / 60),
+            firstClickDate: context.globalState.get('autoAcceptFirstClickDate', null),
+            lastDismissedMilestone: context.globalState.get('autoAcceptLastDismissedMilestone', 0),
+            currentMilestone,
+            currentRank: MILESTONE_RANKS[currentMilestone] || null,
+            nextMilestone: nextM || null,
+            nextRank: nextM ? MILESTONE_RANKS[nextM] : null
+        };
+    });
 
     context.subscriptions.push(
         vscode.commands.registerCommand('autoAcceptV2.dashboard', () => {
             dashboardProvider.show();
         })
     );
+
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.command = 'autoAcceptV2.toggle';

@@ -82,7 +82,15 @@ class DashboardProvider {
                 allowedCommands: config.get('allowedCommands', []),
                 pollInterval: config.get('pollInterval', 500),
                 cdpPort: config.get('cdpPort', 9333),
-                customButtonTexts: config.get('customButtonTexts', [])
+                customButtonTexts: config.get('customButtonTexts', []),
+                totalClicks: status.totalClicks || 0,
+                timeSavedMinutes: status.timeSavedMinutes || 0,
+                firstClickDate: status.firstClickDate || null,
+                lastDismissedMilestone: status.lastDismissedMilestone || 0,
+                currentMilestone: status.currentMilestone || 0,
+                currentRank: status.currentRank || null,
+                nextMilestone: status.nextMilestone || null,
+                nextRank: status.nextRank || null
             }
         });
     }
@@ -157,6 +165,23 @@ class DashboardProvider {
             case 'refresh':
                 this._pushState();
                 break;
+            case 'dismissMilestone': {
+                this._context.globalState.update('autoAcceptLastDismissedMilestone', msg.value);
+                this._pushState();
+                break;
+            }
+            case 'openSponsor': {
+                // Rolling 7-day timestamp array for weekly CTR telemetry
+                const WEEK_MS = 604800000;
+                const now = Date.now();
+                const raw = this._context.globalState.get('autoAcceptSponsorClicks');
+                const prev = Array.isArray(raw) ? raw : []; // Legacy migration: int → array
+                const clicks = prev.filter(t => now - t < WEEK_MS);
+                clicks.push(now);
+                this._context.globalState.update('autoAcceptSponsorClicks', clicks);
+                vscode.env.openExternal(vscode.Uri.parse('https://github.com/yazanbaker94/AntiGravity-AutoAccept'));
+                break;
+            }
         }
     }
 
@@ -288,6 +313,19 @@ class DashboardProvider {
     .activity-entry .time { opacity: 0.5; }
     .activity-entry.blocked { color: var(--danger); }
     .activity-entry.click { color: var(--success); }
+    #sponsor-slot { cursor: pointer; transition: border-color 0.2s ease, background-color 0.2s ease, transform 0.2s ease; }
+    body #sponsor-slot:hover, body #sponsor-slot:focus-visible { background: var(--vscode-textBlockQuote-background, rgba(255,255,255,0.06)); border-color: var(--vscode-focusBorder, var(--vscode-textLink-foreground)); transform: translateY(-1px); outline: none; }
+    body #sponsor-slot:active { transform: translateY(0); }
+
+    /* Milestone banner */
+    .milestone-banner { display: none; background: linear-gradient(135deg, rgba(255,215,0,0.1), rgba(255,165,0,0.08)); border: 1px solid rgba(255,215,0,0.3); border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; text-align: center; }
+    .milestone-banner.visible { display: block; }
+    .milestone-rank { font-size: 18px; font-weight: 700; color: #FFD700; }
+    .milestone-dismiss { background: none; border: 1px solid var(--border); color: var(--fg); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; margin-top: 8px; opacity: 0.7; }
+    .milestone-dismiss:hover { opacity: 1; }
+    .milestone-share { color: var(--accent); text-decoration: none; font-size: 11px; margin-left: 8px; }
+    .milestone-progress { background: rgba(255,255,255,0.08); border-radius: 4px; height: 6px; margin-top: 10px; overflow: hidden; }
+    .milestone-progress-fill { background: linear-gradient(90deg, #FFD700, #FFA500); height: 100%; border-radius: 4px; transition: width 0.5s ease; }
 </style>
 </head>
 <body>
@@ -312,8 +350,49 @@ class DashboardProvider {
 
     <div style="margin-top:16px"></div>
 
+    <!-- Analytics Card (Value-first: immediate dopamine hit) -->
     <div class="card">
-        <div class="card-title">⚙️ Settings</div>
+        <div class="card-title">📊 Analytics</div>
+        <div style="display:flex;gap:12px;text-align:center">
+            <div style="flex:1;background:var(--input-bg);border-radius:8px;padding:14px">
+                <div style="font-size:26px;font-weight:700;color:var(--accent)" id="stat-clicks">0</div>
+                <div style="font-size:10px;opacity:0.5;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px">Total Clicks</div>
+            </div>
+            <div style="flex:1;background:var(--input-bg);border-radius:8px;padding:14px">
+                <div style="font-size:26px;font-weight:700;color:var(--success)" id="stat-time">0m</div>
+                <div style="font-size:10px;opacity:0.5;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px">Time Saved</div>
+                <div style="font-size:10px;opacity:0.4;margin-top:2px" id="stat-dollars"></div>
+            </div>
+            <div style="flex:1;background:var(--input-bg);border-radius:8px;padding:14px">
+                <div style="font-size:26px;font-weight:700" id="stat-since">--</div>
+                <div style="font-size:10px;opacity:0.5;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px">Since</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Milestone Banner (hidden by default, shown via JS) -->
+    <div class="milestone-banner" id="milestone-banner">
+        <div style="font-size:24px">&#127942;</div>
+        <div class="milestone-rank" id="milestone-rank"></div>
+        <div style="font-size:12px;opacity:0.8;margin-top:4px" id="milestone-msg"></div>
+        <div class="milestone-progress" id="milestone-progress-wrap" style="display:none">
+            <div class="milestone-progress-fill" id="milestone-progress-fill" style="width:0%"></div>
+        </div>
+        <div style="margin-top:10px">
+            <button class="milestone-dismiss" id="milestone-dismiss">Dismiss</button>
+            <a class="milestone-share" id="milestone-share" href="#" target="_blank" rel="noopener noreferrer">Share on X &#8599;</a>
+        </div>
+    </div>
+
+    <!-- Sponsor Banner (Premium placement under stats — full card clickable) -->
+    <div id="sponsor-slot" tabindex="0" role="button" aria-label="Sponsor this project" style="background:var(--vscode-textBlockQuote-background, rgba(255,255,255,0.04));border:1px dashed var(--border);border-radius:8px;padding:14px 16px;margin-bottom:16px;text-align:center;font-size:12px;line-height:1.6">
+        <span style="opacity:0.7" id="sponsor-text">Want your brand here? Seen by developers saving time every week.</span><br>
+        <span style="color:var(--accent);font-weight:600">Sponsor this project &#8599;</span>
+    </div>
+
+    <!-- Settings & Command Configuration -->
+    <div class="card">
+        <div class="card-title">&#9881;&#65039; Settings</div>
         <div class="toggle-row">
             <div>
                 <div class="toggle-label">Auto-Accept File Edits</div>
@@ -327,7 +406,7 @@ class DashboardProvider {
     </div>
 
     <div class="card">
-        <div class="card-title">🚫 Blocked Commands</div>
+        <div class="card-title">&#128683; Blocked Commands</div>
         <div class="toggle-desc" style="margin-bottom:8px">Commands matching these patterns will NEVER be auto-run</div>
         <div class="list-editor">
             <div class="list-input">
@@ -339,7 +418,7 @@ class DashboardProvider {
     </div>
 
     <div class="card">
-        <div class="card-title">✅ Allowed Commands</div>
+        <div class="card-title">&#9989; Allowed Commands</div>
         <div class="toggle-desc" style="margin-bottom:8px">If non-empty, ONLY matching commands will be auto-run</div>
         <div class="list-editor">
             <div class="list-input">
@@ -350,8 +429,9 @@ class DashboardProvider {
         </div>
     </div>
 
+    <!-- Activity Log (Diagnostics at absolute bottom) -->
     <div class="card">
-        <div class="card-title">📋 Activity Log</div>
+        <div class="card-title">&#128203; Activity Log</div>
         <div class="activity-log" id="activity-log">
             <div class="empty-note">Waiting for activity...</div>
         </div>
@@ -445,16 +525,128 @@ class DashboardProvider {
         entry.className = 'activity-entry ' + cls;
         entry.innerHTML = '<span class="time">' + data.timestamp + '</span> ' + escHtml(data.message);
         log.insertBefore(entry, log.firstChild);
-        // Keep max 100 entries
-        while (log.children.length > 100) log.removeChild(log.lastChild);
+        // DOM culling: cap at 50 elements. insertBefore(_, firstChild) = newest on top,
+        // so lastElementChild = oldest. Use Element-specific API to avoid text node mismatch.
+        while (log.childElementCount > 50) log.lastElementChild.remove();
     }
 
     // Signal extension host that DOM is ready for state
     vscode.postMessage({ type: 'ready' });
 
+    // Sponsor card — full card clickable (a11y: keyboard + mouse, double-click throttle)
+    (function() {
+        const card = document.getElementById('sponsor-slot');
+        if (!card) return;
+        let locked = false;
+        const openSponsor = () => {
+            if (locked) return;
+            locked = true;
+            vscode.postMessage({ type: 'openSponsor' });
+            setTimeout(() => { locked = false; }, 1000);
+        };
+        card.addEventListener('click', openSponsor);
+        card.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openSponsor(); }
+        });
+    })();
+
+    // Analytics rendering
+    function formatTime(mins) {
+        if (mins >= 60) {
+            const h = Math.floor(mins / 60);
+            const m = mins % 60;
+            return m === 0 ? h + 'h' : h + 'h ' + m + 'm';
+        }
+        return mins + 'm';
+    }
+
+    function updateAnalytics(data) {
+        const clicks = data.totalClicks || 0;
+        const mins = data.timeSavedMinutes || 0;
+
+        // Stats cards
+        const elClicks = document.getElementById('stat-clicks');
+        if (elClicks) elClicks.textContent = clicks.toLocaleString();
+        const elTime = document.getElementById('stat-time');
+        if (elTime) elTime.textContent = formatTime(mins);
+        // Dollar value sub-text
+        const elDollars = document.getElementById('stat-dollars');
+        if (elDollars && mins > 0) elDollars.textContent = '~$' + mins.toLocaleString() + ' value';
+        if (data.firstClickDate) {
+            const d = new Date(data.firstClickDate);
+            const elSince = document.getElementById('stat-since');
+            if (elSince) elSince.textContent = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        }
+
+        // Milestone banner — focus on progress to NEXT rank (dedup with stats)
+        const banner = document.getElementById('milestone-banner');
+        if (banner && data.currentMilestone && data.currentRank) {
+            const dismissed = data.lastDismissedMilestone || 0;
+            if (data.currentMilestone > dismissed) {
+                banner.classList.add('visible');
+                const rankEl = document.getElementById('milestone-rank');
+                if (rankEl) rankEl.textContent = data.currentRank;
+                const msgEl = document.getElementById('milestone-msg');
+                if (msgEl) {
+                    if (data.nextMilestone && data.nextRank) {
+                        const remaining = data.nextMilestone - clicks;
+                        msgEl.textContent = remaining.toLocaleString() + ' clicks until ' + data.nextRank;
+                    } else {
+                        msgEl.textContent = 'Maximum rank achieved!';
+                    }
+                }
+                // Progress bar
+                const progressWrap = document.getElementById('milestone-progress-wrap');
+                const progressFill = document.getElementById('milestone-progress-fill');
+                if (progressWrap && progressFill) {
+                    if (data.nextMilestone) {
+                        progressWrap.style.display = 'block';
+                        const currentBase = data.currentMilestone || 0;
+                        const range = data.nextMilestone - currentBase;
+                        const progress = clicks - currentBase;
+                        const pct = range > 0 ? Math.min(100, Math.max(0, Math.round((progress / range) * 100))) : 0;
+                        progressFill.style.width = pct + '%';
+                    } else {
+                        // Max rank achieved — full bar
+                        progressWrap.style.display = 'block';
+                        progressFill.style.width = '100%';
+                    }
+                }
+                const shareEl = document.getElementById('milestone-share');
+                if (shareEl) {
+                    const tweet = 'I just hit ' + clicks.toLocaleString() + ' auto-clicks with AntiGravity AutoAccept! Rank: ' + data.currentRank + '. Try it: https://github.com/yazanbaker94/AntiGravity-AutoAccept';
+                    shareEl.href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(tweet);
+                }
+            } else {
+                banner.classList.remove('visible');
+            }
+        }
+
+        // Dynamic sponsor text — rank-based archetype pitch
+        const sponsorText = document.getElementById('sponsor-text');
+        if (sponsorText) {
+            if (data.currentRank) {
+                sponsorText.textContent = 'Want your brand here? Reach ' + data.currentRank + '-tier developers who automate their workflows.';
+            } else if (mins > 0) {
+                sponsorText.textContent = 'Want your brand here? Seen by developers who automate their workflows.';
+            }
+        }
+    }
+
+    // Milestone dismiss handler
+    (function() {
+        const btn = document.getElementById('milestone-dismiss');
+        if (!btn) return;
+        btn.addEventListener('click', function() {
+            vscode.postMessage({ type: 'dismissMilestone', value: 0 });
+            const banner = document.getElementById('milestone-banner');
+            if (banner) banner.classList.remove('visible');
+        });
+    })();
+
     window.addEventListener('message', e => {
         const msg = e.data;
-        if (msg.type === 'state') updateUI(msg.data);
+        if (msg.type === 'state') { updateUI(msg.data); updateAnalytics(msg.data); }
         else if (msg.type === 'activity') addActivity(msg.data);
     });
 </script>

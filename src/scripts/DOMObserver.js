@@ -50,13 +50,23 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
     var ALLOWED_COMMANDS = ${JSON.stringify(allowedCommands)};
     var HAS_FILTERS = BLOCKED_COMMANDS.length > 0 || ALLOWED_COMMANDS.length > 0;
 
-    // Self-healing injection: if a previous observer exists (e.g. Extension Host
-    // crashed and re-injected without calling stop()), disconnect it first.
-    // This guarantees at most ONE active AutoAccept observer per page.
-    if (window.__AA_OBSERVER) {
-        window.__AA_OBSERVER.disconnect();
-        window.__AA_OBSERVER = null;
+    // ═══ IDEMPOTENT TEARDOWN ═══
+    // Clean up any previous state (observer, intervals) to prevent leaks on re-injection.
+    if (typeof window.__AA_CLEANUP === 'function') {
+        window.__AA_CLEANUP();
     }
+    window.__AA_CLEANUP = function() {
+        if (window.__AA_OBSERVER) { window.__AA_OBSERVER.disconnect(); window.__AA_OBSERVER = null; }
+        if (window.__AA_FALLBACK_INTERVAL) { clearInterval(window.__AA_FALLBACK_INTERVAL); window.__AA_FALLBACK_INTERVAL = null; }
+    };
+
+    // ═══ WATCHDOG TIMESTAMP ═══
+    // Updated on every scan — heartbeat checks this to detect silently dead observers.
+    window.__AA_LAST_SCAN = Date.now();
+
+    // ═══ CLICK COUNTER ═══
+    // Preserved across re-injections. Heartbeat harvests this for analytics.
+    window.__AA_CLICK_COUNT = window.__AA_CLICK_COUNT || 0;
 
     // Expose filter state as window globals for hot-reload via Runtime.evaluate.
     // pushFilterUpdate() in ConnectionManager overwrites these without re-injecting
@@ -310,6 +320,7 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
     }
 
         function scanAndClick() {
+            window.__AA_LAST_SCAN = Date.now(); // Watchdog: prove we're alive
             if (window.__AA_PAUSED) return null;
             pruneCooldowns();
 
@@ -343,6 +354,7 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
                 clickCooldowns[key] = Date.now();
             }
             btn.click();
+            window.__AA_CLICK_COUNT = (window.__AA_CLICK_COUNT || 0) + 1;
             return 'clicked:' + matchedText;
         }
 
@@ -357,18 +369,25 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
         // because Antigravity buttons appear at the START of mutation bursts
         // (React mounts button → then streams LLM text). A trailing debounce
         // would delay clicks until streaming stops, which is the wrong behavior.
-        var debounceTimer = null;
+        var __AA_SCAN_QUEUED = false;
         var observer = new MutationObserver(function() {
-        if (debounceTimer) return;
-        debounceTimer = setTimeout(function() {
-            debounceTimer = null;
-        scanAndClick();
-        }, 100);
-    });
+            if (__AA_SCAN_QUEUED || window.__AA_PAUSED) return;
+            __AA_SCAN_QUEUED = true;
+            // 50ms time-based debounce — survives background window throttling
+            // (rAF freezes when window is hidden/minimized, deadlocking the observer).
+            // try/finally guarantees lock release even if scanAndClick throws.
+            setTimeout(function() {
+                try {
+                    scanAndClick();
+                } finally {
+                    __AA_SCAN_QUEUED = false;
+                }
+            }, 50);
+        });
 
-        observer.observe(document.body, {
+        observer.observe(document.documentElement, {
             childList: true,
-        subtree: true,
+            subtree: true,
             attributes: true,
             attributeFilter: ['class', 'style', 'hidden', 'aria-expanded', 'data-state']
         });
