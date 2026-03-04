@@ -336,8 +336,10 @@ class ConnectionManager {
     }
 
     _isCandidate(targetInfo) {
-        const { url, type } = targetInfo;
+        const { type, url } = targetInfo;
         if (!url) return false;
+        // Skip service workers and web workers — they have no DOM or window
+        if (type === 'service_worker' || type === 'worker' || type === 'shared_worker') return false;
         return type === 'page' ||
             url.includes('vscode-webview://') ||
             url.includes('webview') ||
@@ -385,6 +387,18 @@ class ConnectionManager {
                 }
             }
 
+            // Pre-check: skip windowless contexts (service workers, shared workers)
+            const windowCheck = await this._send('Runtime.evaluate', {
+                expression: 'typeof window !== "undefined" && typeof document !== "undefined"'
+            }, sessionId);
+            if (windowCheck.result?.result?.value !== true) {
+                this.log(`[CDP] [${shortId}] No window/document (likely worker), ignoring`);
+                await this._send('Target.detachFromTarget', { sessionId })
+                    .catch(e => this.log(`[CDP] [${shortId}] Detach failed: ${e.message}`));
+                this.ignoredTargets.add(targetId);
+                return;
+            }
+
             // Inject MutationObserver payload
             const result = await this._injectObserver(sessionId);
 
@@ -394,9 +408,17 @@ class ConnectionManager {
                 await this._send('Target.detachFromTarget', { sessionId })
                     .catch(e => this.log(`[CDP] [${shortId}] Detach failed: ${e.message}`));
                 // Only permanently blacklist if definitively the wrong context.
-                // Transient failures (undefined) remain eligible for rediscovery.
+                // Transient failures get 3 retries before permanent blacklist.
                 if (result === 'not-agent-panel') {
                     this.ignoredTargets.add(targetId);
+                } else {
+                    const count = (this._injectionFailCounts?.get(targetId) || 0) + 1;
+                    if (!this._injectionFailCounts) this._injectionFailCounts = new Map();
+                    this._injectionFailCounts.set(targetId, count);
+                    if (count >= 3) {
+                        this.log(`[CDP] [${shortId}] Failed ${count} times, permanently ignoring`);
+                        this.ignoredTargets.add(targetId);
+                    }
                 }
                 return;
             }
@@ -447,8 +469,22 @@ class ConnectionManager {
             this.allowedCommands,
             this.autoAcceptFileEdits
         );
-        const evalMsg = await this._send('Runtime.evaluate', { expression: script }, sessionId);
-        return evalMsg.result?.result?.value || 'undefined';
+        try {
+            const evalMsg = await this._send('Runtime.evaluate', { expression: script }, sessionId);
+            if (evalMsg.error) {
+                this.log(`[CDP] Injection CDP error: ${JSON.stringify(evalMsg.error)}`);
+                return 'cdp-error';
+            }
+            const exDesc = evalMsg.result?.exceptionDetails;
+            if (exDesc) {
+                this.log(`[CDP] Injection exception: ${exDesc.text || ''} ${exDesc.exception?.description || ''}`);
+                return 'script-exception';
+            }
+            return evalMsg.result?.result?.value || 'undefined';
+        } catch (e) {
+            this.log(`[CDP] Injection threw: ${e.message}`);
+            return 'thrown-error';
+        }
     }
 
     async _reinjectForSession(sessionId) {
