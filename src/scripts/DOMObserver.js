@@ -108,8 +108,9 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
         var el = node;
         while (el && el !== document.body) {
             var tag = (el.tagName || '').toLowerCase();
-            if (tag === 'button' || tag.includes('button') || tag.includes('btn') ||
-                el.getAttribute('role') === 'button' || el.classList.contains('cursor-pointer') ||
+            if (tag === 'button' || tag === 'a' || tag.includes('button') || tag.includes('btn') ||
+                el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link' ||
+                el.classList.contains('cursor-pointer') ||
                 el.onclick || el.getAttribute('tabindex') === '0') {
                 return el;
             }
@@ -174,8 +175,9 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
                 var clickable = closestClickable(wNode);
                 var tag2 = (clickable.tagName || '').toLowerCase();
                 var isExpandType = (text === 'expand' || text === 'requires input');
-                if (tag2 === 'button' || tag2.includes('button') || clickable.getAttribute('role') === 'button' ||
-                    tag2.includes('btn') || clickable.classList.contains('cursor-pointer') ||
+                if (tag2 === 'button' || tag2 === 'a' || tag2.includes('button') || tag2.includes('btn') ||
+                    clickable.getAttribute('role') === 'button' || clickable.getAttribute('role') === 'link' ||
+                    clickable.classList.contains('cursor-pointer') ||
                     clickable.onclick || clickable.getAttribute('tabindex') === '0') {
                     // Idempotency guard: skip disabled/loading buttons
                     if (clickable.disabled || clickable.getAttribute('aria-disabled') === 'true' ||
