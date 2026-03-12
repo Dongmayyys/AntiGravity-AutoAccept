@@ -1,69 +1,149 @@
 // AntiGravity AutoAccept — CDP Connection Manager
-// Persistent browser-level WebSocket connection with session pooling.
-// Replaces the old poll→attach→evaluate→detach cycle with:
-//   connect once → discover targets → inject MutationObserver → keep alive
+// Child process isolation: all ws WebSocket instances live in a forked
+// child process (cdp-worker.js). The main extension process has ZERO
+// WebSocket instances, making it immune to the "Cannot freeze array
+// buffer views with elements" crash (issue #36).
 
 const http = require('http');
-const WebSocket = require('ws');
+const path = require('path');
+const { fork } = require('child_process');
 const { buildDOMObserverScript } = require('../scripts/DOMObserver');
 
 class ConnectionManager {
-    /**
-     * @param {Object} options
-     * @param {Function} options.log - Logging function
-     * @param {Function} options.getPort - Returns configured CDP port
-     * @param {Function} options.getCustomTexts - Returns custom button texts array
-     */
     constructor({ log, getPort, getCustomTexts }) {
         this.log = log;
         this.getPort = getPort;
         this.getCustomTexts = getCustomTexts;
 
-        // Connection state
-        this.ws = null;
-        this.msgId = 0;
-        this.pending = new Map();           // id → { resolve, reject, timer }
-        this.sessions = new Map();          // targetId → sessionId
-        this.sessionUrls = new Map();       // targetId → url (for URL-based dedup)
-        this.pendingUrls = new Set();       // URLs currently being attached (TOCTOU lock)
-        this.ignoredTargets = new Set();    // targetIds rejected (no-dom, not-agent-panel)
+        // Tracked targets (metadata only — no sockets in this process)
+        this.sessions = new Map();          // targetId → { url, wsUrl }
+        this.sessionUrls = new Map();       // targetId → url (compat)
+        this.ignoredTargets = new Set();
         this.activeCdpPort = null;
 
-        // Command filters (set by extension.js from user config)
+        // Command filters
         this.blockedCommands = [];
         this.allowedCommands = [];
         this.autoAcceptFileEdits = true;
 
         // Lifecycle
         this.isRunning = false;
-        this.isPaused = false; // Soft toggle: true = stop clicking, keep WS alive
+        this.isPaused = false;
         this.isConnecting = false;
         this.reconnectTimer = null;
         this.heartbeatTimer = null;
-        this.onStatusChange = null; // Callback when CDP status changes
-        this.onClickTelemetry = null; // Callback with click delta for analytics
-        this._sessionFailCounts = new Map(); // Consecutive heartbeat failures per targetId
-        this._heartbeatRunning = false; // Re-entrancy guard for heartbeat (Bug 8)
-        this._pingTimer = null; // WebSocket keepalive ping interval (Bug 9)
+        this.onStatusChange = null;
+        this.onClickTelemetry = null;
+        this._sessionFailCounts = new Map();
+        this._heartbeatRunning = false;
+        this._injectionFailCounts = new Map();
+
+        // Child process (owns all WebSocket instances)
+        this._worker = null;
+        this._pendingIpc = new Map();
+        this._ipcId = 0;
+
+        // Compat shim
+        this._connected = false;
     }
 
-    /**
-     * Updates the command filter lists. Called by extension.js when config changes.
-     * @param {string[]} blocked - Patterns to never auto-run
-     * @param {string[]} allowed - If non-empty, only auto-run matching patterns
-     */
+    get ws() {
+        return this._connected ? { readyState: 1 } : null;
+    }
+
+    // ─── Child Process Management ─────────────────────────────────────
+
+    _ensureWorker() {
+        if (this._worker && !this._worker.killed) return this._worker;
+
+        const workerPath = path.join(__dirname, 'cdp-worker.js');
+        this._worker = fork(workerPath, [], { silent: true });
+
+        this._worker.on('message', (msg) => {
+            if (msg.id && this._pendingIpc.has(msg.id)) {
+                const handler = this._pendingIpc.get(msg.id);
+                this._pendingIpc.delete(msg.id);
+                clearTimeout(handler.timer);
+                if (msg.error) {
+                    handler.reject(new Error(msg.error));
+                } else {
+                    handler.resolve(msg.result || msg);
+                }
+            }
+        });
+
+        this._worker.on('exit', (code) => {
+            this.log(`[CDP] Worker exited (code ${code})`);
+            this._worker = null;
+            for (const [id, handler] of this._pendingIpc) {
+                clearTimeout(handler.timer);
+                handler.reject(new Error('worker exited'));
+            }
+            this._pendingIpc.clear();
+        });
+
+        this._worker.on('error', (e) => {
+            this.log(`[CDP] Worker error: ${e.message}`);
+        });
+
+        if (this._worker.stdout) {
+            this._worker.stdout.on('data', (d) => this.log(`[Worker] ${d.toString().trim()}`));
+        }
+        if (this._worker.stderr) {
+            this._worker.stderr.on('data', (d) => this.log(`[Worker ERR] ${d.toString().trim()}`));
+        }
+
+        this.log('[CDP] Worker process spawned');
+        return this._worker;
+    }
+
+    _workerEval(wsUrl, expression) {
+        return new Promise((resolve, reject) => {
+            const worker = this._ensureWorker();
+            const id = ++this._ipcId;
+            const timer = setTimeout(() => {
+                this._pendingIpc.delete(id);
+                reject(new Error('ipc timeout'));
+            }, 10000);
+            this._pendingIpc.set(id, { resolve, reject, timer });
+            worker.send({ type: 'eval', id, wsUrl, expression });
+        });
+    }
+
+    _workerBurstInject(wsUrl, targetId, script, isPaused) {
+        return new Promise((resolve, reject) => {
+            const worker = this._ensureWorker();
+            const id = ++this._ipcId;
+            const timer = setTimeout(() => {
+                this._pendingIpc.delete(id);
+                reject(new Error('ipc timeout'));
+            }, 15000);
+            this._pendingIpc.set(id, { resolve, reject, timer });
+            worker.send({ type: 'burst-inject', id, wsUrl, targetId, script, isPaused });
+        });
+    }
+
+    _killWorker() {
+        if (this._worker && !this._worker.killed) {
+            try { this._worker.send({ type: 'shutdown' }); } catch (e) { }
+            setTimeout(() => {
+                if (this._worker && !this._worker.killed) {
+                    this._worker.kill();
+                }
+            }, 1000);
+        }
+        this._worker = null;
+    }
+
+    // ─── Public API ───────────────────────────────────────────────────
+
     setCommandFilters(blocked, allowed) {
         this.blockedCommands = blocked || [];
         this.allowedCommands = allowed || [];
     }
 
-    /**
-     * Hot-reloads filter config into all live CDP sessions via Runtime.evaluate.
-     * Overwrites window.__AA_* globals without re-injecting the full script
-     * (which would create duplicate MutationObserver instances).
-     */
     async pushFilterUpdate(blocked, allowed) {
-        if (!this.ws || this.sessions.size === 0) return;
+        if (this.sessions.size === 0) return;
         const hasFilters = (blocked.length > 0 || allowed.length > 0);
         const expr = `
             window.__AA_BLOCKED = ${JSON.stringify(blocked)};
@@ -71,77 +151,42 @@ class ConnectionManager {
             window.__AA_HAS_FILTERS = ${hasFilters};
             'filters-updated';
         `;
-        for (const [targetId, sessionId] of this.sessions) {
+        for (const [targetId, info] of this.sessions) {
             try {
-                await this._send('Runtime.evaluate', { expression: expr }, sessionId);
-                this.log(`[CDP] Pushed filter update to session ${targetId.substring(0, 6)}`);
-            } catch (e) {
-                // Session may have been destroyed — ignore
-            }
-        }
-    }
-    /**
-     * Re-injects the DOMObserver on all active sessions.
-     * Safe: IDEMPOTENCY_GUARD + self-healing in DOMObserver disconnects old observer.
-     * Used when button text list changes (e.g., autoAcceptFileEdits toggle).
-     */
-    reinjectAll() {
-        if (!this.ws || this.sessions.size === 0) return;
-        // Call __AA_CLEANUP + reset idempotency flag so re-injection proceeds cleanly
-        const resetExpr = 'if (typeof window.__AA_CLEANUP === "function") window.__AA_CLEANUP(); window.__AA_OBSERVER_ACTIVE = false; "reset"';
-        for (const [targetId, sessionId] of this.sessions) {
-            this._send('Runtime.evaluate', { expression: resetExpr }, sessionId)
-                .then(() => this._injectObserver(sessionId))
-                .then(result => this.log(`[CDP] Re-injected [${targetId.substring(0, 6)}] → ${result}`))
-                .catch(e => this.log(`[CDP] Reinject failed for ${targetId.substring(0, 6)}: ${e.message}`));
+                await this._workerEval(info.wsUrl, expr);
+                this.log(`[CDP] Pushed filter update to ${targetId.substring(0, 6)}`);
+            } catch (e) { }
         }
     }
 
-    /**
-     * Kill signal: pauses all injected observers and disconnects them.
-     * Must be called BEFORE closing the WebSocket (fire-and-forget).
-     * Sets __AA_PAUSED=true for immediate click suppression,
-     * then disconnects the MutationObserver to stop DOM watching.
-     */
-    _disableObservers() {
-        if (!this.ws || this.sessions.size === 0) return;
-        const killExpr = `
-            window.__AA_PAUSED = true;
-            if (window.__AA_OBSERVER) {
-                window.__AA_OBSERVER.disconnect();
-                window.__AA_OBSERVER = null;
-            }
-            'observers-killed';
-        `;
-        for (const [targetId, sessionId] of this.sessions) {
+    async reinjectAll() {
+        if (this.sessions.size === 0) return;
+        const script = buildDOMObserverScript(
+            this.getCustomTexts(), this.blockedCommands, this.allowedCommands, this.autoAcceptFileEdits
+        );
+        for (const [targetId, info] of this.sessions) {
             try {
-                this._send('Runtime.evaluate', { expression: killExpr }, sessionId);
-                this.log(`[CDP] Sent kill signal to session ${targetId.substring(0, 6)}`);
+                const msg = await this._workerBurstInject(info.wsUrl, targetId, script, this.isPaused);
+                const result = msg.result || 'unknown';
+                this.log(`[CDP] Re-injected [${targetId.substring(0, 6)}] → ${result}`);
             } catch (e) {
-                this.log(`[CDP] Kill signal failed for ${targetId.substring(0, 6)}: ${e.message}`);
+                this.log(`[CDP] Reinject failed for ${targetId.substring(0, 6)}: ${e.message}`);
             }
         }
     }
-
-    // ─── Public API ───────────────────────────────────────────────────
 
     start() {
         if (this.isRunning) return;
         this.isRunning = true;
         this.isPaused = false;
-        this.log('[CDP] Connection manager starting');
+        this.log('[CDP] Connection manager starting (child process isolation)');
         this.connect();
     }
 
-    /**
-     * Soft toggle OFF: pause all observers but keep the WS connection alive.
-     * Use this for the UI toggle — avoids WS teardown/reconnect race conditions.
-     */
     pause() {
         this.isPaused = true;
-        const pauseExpr = 'window.__AA_PAUSED = true; "paused"';
-        for (const [targetId, sessionId] of this.sessions) {
-            this._send('Runtime.evaluate', { expression: pauseExpr }, sessionId)
+        for (const [targetId, info] of this.sessions) {
+            this._workerEval(info.wsUrl, 'window.__AA_PAUSED = true; "paused"')
                 .then(() => this.log(`[CDP] Paused session ${targetId.substring(0, 6)}`))
                 .catch(e => this.log(`[CDP] Pause failed for ${targetId.substring(0, 6)}: ${e.message}`));
         }
@@ -149,23 +194,13 @@ class ConnectionManager {
         if (this.onStatusChange) this.onStatusChange();
     }
 
-    /**
-     * Soft toggle ON: unpause all observers. No re-injection needed.
-     */
     unpause() {
         this.isPaused = false;
-        // Nuclear unpause: re-inject all observers to guarantee pristine, known-good state.
-        // This ensures that even if the observer was silently disconnected during the pause,
-        // the system deterministically re-establishes all bindings.
         this.reinjectAll();
         this.log('[CDP] All sessions unpaused + re-injected');
         if (this.onStatusChange) this.onStatusChange();
     }
 
-    /**
-     * Full teardown: only for extension deactivation, NOT for UI toggle.
-     * Strips WS listeners to prevent ghost close events.
-     */
     stop() {
         this.isRunning = false;
         this.isPaused = false;
@@ -173,48 +208,53 @@ class ConnectionManager {
         this.reconnectTimer = null;
         clearTimeout(this.heartbeatTimer);
         this.heartbeatTimer = null;
-        clearInterval(this._pingTimer);
-        this._pingTimer = null;
-        this._disableObservers();
-        this._closeWebSocket();
+        for (const [targetId, info] of this.sessions) {
+            this._workerEval(info.wsUrl, `
+                window.__AA_PAUSED = true;
+                if (window.__AA_OBSERVER) { window.__AA_OBSERVER.disconnect(); window.__AA_OBSERVER = null; }
+                'killed';
+            `).catch(() => {});
+        }
         this.sessions.clear();
         this.sessionUrls.clear();
-        this.pendingUrls.clear();
         this.ignoredTargets.clear();
         this._sessionFailCounts.clear();
-        this._clearPending();
+        this._injectionFailCounts.clear();
+        this._connected = false;
+        this._killWorker();
         this.log('[CDP] Connection manager stopped');
     }
 
-    getSessionCount() {
-        return this.sessions.size;
-    }
-
-    getActivePort() {
-        return this.activeCdpPort;
-    }
+    getSessionCount() { return this.sessions.size; }
+    getActivePort() { return this.activeCdpPort; }
 
     // ─── Connection Lifecycle ─────────────────────────────────────────
 
     async connect() {
         if (!this.isRunning || this.isConnecting) return;
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
         this.isConnecting = true;
 
         try {
             const port = await this._findActivePort();
-            if (!port) {
+            if (!port) { this._scheduleReconnect(); return; }
+
+            const targets = await this._getTargetList(port);
+            if (!targets || targets.length === 0) {
+                this.log('[CDP] No targets found');
                 this._scheduleReconnect();
                 return;
             }
 
-            const wsUrl = await this._getBrowserWsUrl(port);
-            if (!wsUrl) {
-                this._scheduleReconnect();
-                return;
-            }
+            this._connected = true;
+            if (this.onStatusChange) this.onStatusChange();
 
-            await this._establishConnection(wsUrl);
+            const candidates = targets.filter(t => this._isCandidate(t));
+            this.log(`[CDP] Found ${targets.length} targets, ${candidates.length} candidates`);
+
+            await Promise.allSettled(candidates.map(t => this._handleNewTarget(t)));
+
+            this.log(`[CDP] ${this.sessions.size} sessions active after initial scan`);
+            this._scheduleHeartbeat();
         } catch (e) {
             this.log(`[CDP] Connection error: ${e.message}`);
             this._scheduleReconnect();
@@ -223,168 +263,28 @@ class ConnectionManager {
         }
     }
 
-    _establishConnection(wsUrl) {
-        return new Promise((resolve, reject) => {
-            const ws = new WebSocket(wsUrl);
-            const timeout = setTimeout(() => {
-                try { ws.close(); } catch (e) { }
-                reject(new Error('Connection timeout'));
-            }, 10000);
-
-            ws.on('open', async () => {
-                clearTimeout(timeout);
-                this.ws = ws;
-                this.log('[CDP] Persistent connection established');
-                if (this.onStatusChange) this.onStatusChange();
-
-                try {
-                    await this._initializeTargetDiscovery();
-
-                    // Heartbeat: periodic health check + new target discovery
-                    // Bug 8 fix: use recursive setTimeout instead of setInterval
-                    // to prevent stacked heartbeats after system sleep/resume
-                    this._scheduleHeartbeat();
-
-                    // Bug 9 fix: WebSocket ping/pong keepalive for zombie detection
-                    this._startPingPong();
-
-                    resolve();
-                } catch (e) {
-                    this.log(`[CDP] Initialization error: ${e.message}`);
-                    ws.close();
-                    reject(e);
-                }
-            });
-
-            ws.on('message', (raw) => this._onMessage(raw));
-
-            ws.on('close', () => {
-                clearTimeout(timeout);
-                // Only run cleanup if THIS ws is still the active connection.
-                // Prevents stale close events from wiping a newly-established session.
-                if (this.ws === ws) {
-                    this._onClose();
-                }
-            });
-
-            ws.on('error', () => {
-                // onClose will fire after this — no action needed here
-            });
-        });
-    }
-
-    // ─── Message Handling ─────────────────────────────────────────────
-
-    _onMessage(raw) {
-        try {
-            const msg = JSON.parse(raw.toString());
-
-            // Response to a pending request
-            if (msg.id && this.pending.has(msg.id)) {
-                const handler = this.pending.get(msg.id);
-                this.pending.delete(msg.id);
-                clearTimeout(handler.timer);
-                handler.resolve(msg);
-                return;
-            }
-
-            // CDP Events — minimal handler set (no Target.setDiscoverTargets).
-            // Target lifecycle events (targetCreated/targetDestroyed) are NOT
-            // subscribed to avoid interfering with AG's browser subagent.
-            // Target discovery is handled solely via heartbeat polling.
-            switch (msg.method) {
-                case 'Runtime.executionContextsCleared':
-                    // Webview navigated internally — re-inject observer
-                    if (msg.sessionId) this._reinjectForSession(msg.sessionId);
-                    break;
-            }
-        } catch (e) {
-            // Malformed message — ignore
-        }
-    }
-
-    _onClose() {
-        this.log('[CDP] Connection closed');
-        try {
-            this.ws = null;
-            this.sessions.clear();
-            this.sessionUrls.clear();
-            this.pendingUrls.clear();
-            this.ignoredTargets.clear();
-            this._sessionFailCounts.clear();
-            this._clearPending();
-            clearTimeout(this.heartbeatTimer);
-            this.heartbeatTimer = null;
-            clearInterval(this._pingTimer);
-            this._pingTimer = null;
-            if (this.onStatusChange) this.onStatusChange();
-        } catch (e) {
-            this.log(`[CDP] Teardown error (non-fatal): ${e.message}`);
-        } finally {
-            // Guarantee reconnection regardless of teardown exceptions
-            if (this.isRunning) {
-                this._scheduleReconnect();
-            }
-        }
-    }
-
-    // ─── Target Discovery & Session Management ────────────────────────
-
-    async _initializeTargetDiscovery() {
-        // Browser subagent compatibility: NO Target.setDiscoverTargets.
-        // Subscribing to target lifecycle events broadcasts them to ALL CDP
-        // clients sharing this Electron process's debug port. This interferes
-        // with AG's internal browser subagent target management, causing
-        // "Cannot freeze array buffer views" crashes.
-        // Instead, we rely solely on heartbeat polling (Target.getTargets).
-
-        // Scan existing targets
-        const msg = await this._send('Target.getTargets');
-        const targets = msg.result?.targetInfos || [];
-        this.log(`[CDP] Found ${targets.length} targets`);
-
-        // Attach to all candidate targets concurrently
-        const candidates = targets.filter(t => this._isCandidate(t));
-        await Promise.allSettled(candidates.map(t => this._handleNewTarget(t)));
-
-        this.log(`[CDP] ${this.sessions.size} sessions active after initial scan`);
-    }
+    // ─── Target Discovery ─────────────────────────────────────────────
 
     _isCandidate(targetInfo) {
-        const { type, url } = targetInfo;
+        const type = targetInfo.type;
+        const url = targetInfo.url || '';
         if (!url) return false;
-        // Skip service workers and web workers — they have no DOM or window
         if (type === 'service_worker' || type === 'worker' || type === 'shared_worker') return false;
-        // Issue #36 fix (v2): WHITELIST approach — only attach to VS Code webview targets.
-        // The old blacklist (skip http/https) leaked targets: browser sub-agent pages
-        // start as about:blank before navigating, slipping past the filter.
-        // Competing CDP attachments on the same target cause "Cannot freeze array
-        // buffer views with elements" crashes in the AG chat agent.
-        // Whitelist is airtight: only vscode-webview:// URLs belong to us.
-        if (!url.includes('vscode-webview')) return false;
-        return type === 'page' || type === 'iframe';
+        if (url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank') return false;
+        return type === 'page' || type === 'iframe' ||
+            url.includes('vscode-webview') || url.includes('webview');
     }
 
     async _handleNewTarget(targetInfo) {
-        const { targetId, type, url } = targetInfo;
+        const { id: targetId, webSocketDebuggerUrl, type, url } = targetInfo;
+        if (!targetId || !webSocketDebuggerUrl) return;
         const shortId = targetId.substring(0, 6);
+        if (this.sessions.has(targetId) || this.ignoredTargets.has(targetId)) return;
 
-        if (!this._isCandidate(targetInfo)) {
-            return;
-        }
-        if (this.sessions.has(targetId)) {
-            return;
-        }
-        if (this.ignoredTargets.has(targetId)) {
-            return;
-        }
-
-        // URL-based deduplication: skip targets that share a URL with an existing session.
+        // URL dedup
         if (url) {
-            for (const [existingTid] of this.sessions) {
-                const existingUrl = this.sessionUrls.get(existingTid);
-                if (existingUrl && existingUrl === url) {
-                    this.log(`[CDP] [${shortId}] Skipping — URL already covered by session ${existingTid.substring(0, 6)}`);
+            for (const [existingTid, info] of this.sessions) {
+                if (info.url && info.url === url) {
                     this.ignoredTargets.add(targetId);
                     return;
                 }
@@ -392,219 +292,30 @@ class ConnectionManager {
         }
 
         try {
-            const attachMsg = await this._send('Target.attachToTarget', { targetId, flatten: true });
-            const sessionId = attachMsg.result?.sessionId;
-            if (!sessionId) {
-                this.log(`[CDP] [${shortId}] No sessionId returned. Error: ${JSON.stringify(attachMsg.error || 'none')}`);
-                return;
-            }
+            const script = buildDOMObserverScript(
+                this.getCustomTexts(), this.blockedCommands, this.allowedCommands, this.autoAcceptFileEdits
+            );
+            const msg = await this._workerBurstInject(webSocketDebuggerUrl, targetId, script, this.isPaused);
+            const result = msg.result || 'unknown';
 
-            // Enable Runtime events for this session
-            await this._send('Runtime.enable', {}, sessionId)
-                .catch(e => this.log(`[CDP] [${shortId}] Runtime.enable failed: ${e.message}`));
-
-            // For page targets, verify DOM access before injecting
-            if (type === 'page') {
-                const domCheck = await this._send('Runtime.evaluate', {
-                    expression: 'typeof document !== "undefined" ? document.title || "has-dom" : "no-dom"'
-                }, sessionId);
-                const domResult = domCheck.result?.result?.value;
-                if (!domResult || domResult === 'no-dom') {
-                    this.log(`[CDP] [${shortId}] No DOM access, detaching`);
-                    await this._send('Target.detachFromTarget', { sessionId })
-                        .catch(e => this.log(`[CDP] [${shortId}] Detach failed: ${e.message}`));
-                    this.ignoredTargets.add(targetId);
-                    return;
-                }
-            }
-
-            // Pre-check: skip windowless contexts (service workers, shared workers)
-            const windowCheck = await this._send('Runtime.evaluate', {
-                expression: 'typeof window !== "undefined" && typeof document !== "undefined"'
-            }, sessionId);
-            if (windowCheck.result?.result?.value !== true) {
-                this.log(`[CDP] [${shortId}] No window/document (likely worker), ignoring`);
-                await this._send('Target.detachFromTarget', { sessionId })
-                    .catch(e => this.log(`[CDP] [${shortId}] Detach failed: ${e.message}`));
-                this.ignoredTargets.add(targetId);
-                return;
-            }
-
-            // Inject MutationObserver payload
-            const result = await this._injectObserver(sessionId);
-
-            // Whitelist: only keep sessions where injection definitively succeeded
             if (result !== 'observer-installed' && result !== 'already-active') {
-                this.log(`[CDP] [${shortId}] Injection failed (${result}), detaching`);
-                await this._send('Target.detachFromTarget', { sessionId })
-                    .catch(e => this.log(`[CDP] [${shortId}] Detach failed: ${e.message}`));
-                // Only permanently blacklist if definitively the wrong context.
-                // Transient failures get 3 retries before permanent blacklist.
-                if (result === 'not-agent-panel') {
+                this.log(`[CDP] [${shortId}] Injection result: ${result}`);
+                if (result === 'not-agent-panel' || result === 'no-window') {
                     this.ignoredTargets.add(targetId);
                 } else {
-                    const count = (this._injectionFailCounts?.get(targetId) || 0) + 1;
-                    if (!this._injectionFailCounts) this._injectionFailCounts = new Map();
+                    const count = (this._injectionFailCounts.get(targetId) || 0) + 1;
                     this._injectionFailCounts.set(targetId, count);
-                    if (count >= 3) {
-                        this.log(`[CDP] [${shortId}] Failed ${count} times, permanently ignoring`);
-                        this.ignoredTargets.add(targetId);
-                    }
+                    if (count >= 3) this.ignoredTargets.add(targetId);
                 }
                 return;
             }
 
-            // Keep session alive in pool
-            this.sessions.set(targetId, sessionId);
+            this.sessions.set(targetId, { url: url || '', wsUrl: webSocketDebuggerUrl });
             this.sessionUrls.set(targetId, url || '');
-            this.log(`[CDP] ✓ Attached [${shortId}] → ${result} (${(url || '').substring(0, 50)})`);
-
-            // If extension is currently paused, immediately pause this new session
-            if (this.isPaused) {
-                this._send('Runtime.evaluate', {
-                    expression: 'window.__AA_PAUSED = true; "paused-on-attach"'
-                }, sessionId).catch(e => this.log(`[CDP] [${shortId}] Pause-on-attach failed: ${e.message}`));
-            }
+            this.log(`[CDP] ✓ Injected [${shortId}] → ${result} (${(url || '').substring(0, 50)})`);
         } catch (e) {
-            this.log(`[CDP] [${shortId}] Attach error: ${e.message}`);
-        } finally {
-            if (url) this.pendingUrls.delete(url);
+            this.log(`[CDP] [${shortId}] Inject error: ${e.message}`);
         }
-    }
-
-    _handleTargetDestroyed(targetId) {
-        if (this.sessions.has(targetId)) {
-            this.sessions.delete(targetId);
-            this.sessionUrls.delete(targetId);
-            this.log(`[CDP] Target destroyed [${targetId.substring(0, 6)}]`);
-        }
-        // Clean up all caches to prevent memory leak over long sessions
-        this.ignoredTargets.delete(targetId);
-        this._sessionFailCounts.delete(targetId);
-    }
-
-    _handleSessionDetached(sessionId) {
-        if (!sessionId) return;
-        for (const [tid, sid] of this.sessions) {
-            if (sid === sessionId) {
-                this.sessions.delete(tid);
-                this.sessionUrls.delete(tid);
-                this._sessionFailCounts.delete(tid);
-                this.log(`[CDP] Session detached [${tid.substring(0, 6)}]`);
-                break;
-            }
-        }
-    }
-
-    // ─── Observer Injection ───────────────────────────────────────────
-
-    async _injectObserver(sessionId) {
-        const script = buildDOMObserverScript(
-            this.getCustomTexts(),
-            this.blockedCommands,
-            this.allowedCommands,
-            this.autoAcceptFileEdits
-        );
-        try {
-            // Force-clear stale observer flag from previous sessions.
-            // Without this, webviews that retain window globals across extension
-            // restarts would return 'already-active' with a dead observer.
-            await this._send('Runtime.evaluate', {
-                expression: 'if (typeof window !== "undefined") { if (typeof window.__AA_CLEANUP === "function") window.__AA_CLEANUP(); window.__AA_OBSERVER_ACTIVE = false; }'
-            }, sessionId).catch(() => { });
-            const evalMsg = await this._send('Runtime.evaluate', { expression: script }, sessionId);
-            if (evalMsg.error) {
-                this.log(`[CDP] Injection CDP error: ${JSON.stringify(evalMsg.error)}`);
-                return 'cdp-error';
-            }
-            const exDesc = evalMsg.result?.exceptionDetails;
-            if (exDesc) {
-                this.log(`[CDP] Injection exception: ${exDesc.text || ''} ${exDesc.exception?.description || ''}`);
-                return 'script-exception';
-            }
-            return evalMsg.result?.result?.value || 'undefined';
-        } catch (e) {
-            this.log(`[CDP] Injection threw: ${e.message}`);
-            return 'thrown-error';
-        }
-    }
-
-    async _reinjectForSession(sessionId) {
-        // Find the targetId for this session
-        let targetId = null;
-        for (const [tid, sid] of this.sessions) {
-            if (sid === sessionId) { targetId = tid; break; }
-        }
-        if (!targetId) return;
-
-        // Bug 13 fix: don't re-inject active observer when extension is paused
-        // Prevents click leaks between re-injection and pause flag propagation
-        if (this.isPaused) {
-            this.log(`[CDP] [${targetId.substring(0, 6)}] Skipping re-inject — extension is paused`);
-            return;
-        }
-
-        const shortId = targetId.substring(0, 6);
-
-        // Bounded retry: poll for a valid execution context instead of a
-        // hardcoded sleep. Tries up to 5 times at 100ms intervals (500ms max).
-        let contextReady = false;
-        for (let attempt = 0; attempt < 5; attempt++) {
-            await new Promise(r => setTimeout(r, 100));
-            try {
-                await this._send('Runtime.evaluate', {
-                    expression: '"context-alive"'
-                }, sessionId);
-                contextReady = true;
-                break;
-            } catch (e) {
-                // Context not ready yet — retry
-            }
-        }
-        if (!contextReady) {
-            this.log(`[CDP] [${shortId}] Context never stabilized after 500ms, skipping re-inject`);
-            return;
-        }
-
-        // Reset the idempotency guard (isolated try/catch so a destroyed
-        // context doesn't prevent the re-injection attempt below).
-        try {
-            await this._send('Runtime.evaluate', {
-                expression: 'window.__AA_OBSERVER_ACTIVE = false; "reset"'
-            }, sessionId);
-        } catch (e) {
-            // Context may have been destroyed between the probe and this call.
-            // Safe to ignore — a fresh context won't have the flag anyway.
-        }
-
-        try {
-            const result = await this._injectObserver(sessionId);
-            if (result && result !== 'not-agent-panel') {
-                this.log(`[CDP] ✓ Re-injected [${shortId}] → ${result}`);
-            }
-        } catch (e) {
-            this.log(`[CDP] Re-inject failed [${shortId}]: ${e.message}`);
-        }
-    }
-
-    // ─── CDP Protocol Transport ───────────────────────────────────────
-
-    _send(method, params = {}, sessionId = null) {
-        return new Promise((resolve, reject) => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                reject(new Error('not connected'));
-                return;
-            }
-            const id = ++this.msgId;
-            const timer = setTimeout(() => {
-                this.pending.delete(id);
-                reject(new Error(`timeout: ${method}`));
-            }, 5000);
-            this.pending.set(id, { resolve, reject, timer });
-            const payload = { id, method, params };
-            if (sessionId) payload.sessionId = sessionId;
-            this.ws.send(JSON.stringify(payload));
-        });
     }
 
     // ─── Health & Reconnection ────────────────────────────────────────
@@ -618,202 +329,127 @@ class ConnectionManager {
         }, 3000);
     }
 
-    /**
-     * Bug 8 fix: recursive setTimeout for heartbeat — prevents stacking after sleep.
-     * setInterval fires multiple stacked callbacks on wake; setTimeout guarantees
-     * only one heartbeat runs at a time.
-     */
     _scheduleHeartbeat() {
         clearTimeout(this.heartbeatTimer);
-        // 10s interval (down from 30s): compensates for removing
-        // Target.setDiscoverTargets real-time events.
         this.heartbeatTimer = setTimeout(async () => {
             await this._heartbeat();
-            if (this.isRunning && this.ws) {
+            if (this.isRunning && (this.sessions.size > 0 || this._connected)) {
                 this._scheduleHeartbeat();
             }
         }, 10000);
     }
 
-    /**
-     * Bug 9 fix: WebSocket ping/pong keepalive.
-     * Detects zombie connections (TCP dead but readyState still OPEN) after
-     * system sleep. Sends a WS-level ping every 45s; if no pong within 10s,
-     * forces reconnect.
-     */
-    _startPingPong() {
-        clearInterval(this._pingTimer);
-        this._pingTimer = setInterval(() => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-            let pongReceived = false;
-            const pongHandler = () => { pongReceived = true; };
-            this.ws.once('pong', pongHandler);
-            try {
-                this.ws.ping();
-            } catch (e) {
-                this.ws.removeListener('pong', pongHandler);
-                return;
-            }
-            setTimeout(() => {
-                this.ws?.removeListener('pong', pongHandler);
-                if (!pongReceived && this.ws) {
-                    this.log('[CDP] ⚠ No pong received — zombie connection detected, forcing reconnect');
-                    this._closeWebSocket();
-                    this._onClose();
-                }
-            }, 10000);
-        }, 45000);
-    }
-
     async _heartbeat() {
+        if (this._heartbeatRunning) return;
+        this._heartbeatRunning = true;
         try {
-            const msg = await this._send('Target.getTargets');
-            const targets = msg.result?.targetInfos || [];
+            const port = this.activeCdpPort;
+            if (!port) { this._heartbeatRunning = false; return; }
+
+            const targets = await this._getTargetList(port);
+            if (!targets) { this._heartbeatRunning = false; return; }
+
             this.log(`[CDP] Heartbeat: ${targets.length} targets, ${this.sessions.size} sessions`);
 
-            // Browser subagent auto-pause: detect http/https page targets
-            // that indicate the AG browser subagent is active. When detected,
-            // yield the CDP port by disconnecting to prevent ArrayBuffer conflicts.
-            const browserSubagentActive = targets.some(t =>
-                t.type === 'page' && t.url &&
-                (t.url.startsWith('http://') || t.url.startsWith('https://'))
+            // Discover new targets
+            const candidates = targets.filter(t =>
+                this._isCandidate(t) && !this.sessions.has(t.id) && !this.ignoredTargets.has(t.id)
             );
-            if (browserSubagentActive) {
-                this.log('[CDP] ⚠ Browser subagent detected — yielding CDP port');
-                this._closeWebSocket();
-                this._onClose(); // Triggers reconnect via _scheduleReconnect
-                return;
-            }
-
-            // Discover any new targets that appeared since last check
-            const candidates = targets.filter(t => this._isCandidate(t) && !this.sessions.has(t.targetId) && !this.ignoredTargets.has(t.targetId));
             if (candidates.length > 0) {
-                this.log(`[CDP] ${candidates.length} new targets found, attaching...`);
+                this.log(`[CDP] ${candidates.length} new targets found, injecting...`);
                 await Promise.allSettled(candidates.map(t => this._handleNewTarget(t)));
             }
 
-            // Verify existing sessions still have a live observer.
-            // Uses Promise.allSettled for concurrent evaluation — avoids
-            // sequential 5s-timeout blocking per dead session.
-            if (this.sessions.size === 0) return;
+            // Prune gone targets
+            const activeIds = new Set(targets.map(t => t.id));
+            for (const [targetId] of this.sessions) {
+                if (!activeIds.has(targetId)) {
+                    this.sessions.delete(targetId);
+                    this.sessionUrls.delete(targetId);
+                    this._sessionFailCounts.delete(targetId);
+                    this.log(`[CDP] Target [${targetId.substring(0, 6)}] gone, pruned`);
+                }
+            }
 
-            const sessionEntries = [...this.sessions.entries()];
-            const healthResults = await Promise.allSettled(
-                sessionEntries.map(async ([targetId, sessionId]) => {
-                    // Atomic consume-and-reset: IIFE reads click count, diag, AND resets
-                    const check = await this._send('Runtime.evaluate', {
-                        expression: '(() => { const c = window.__AA_CLICK_COUNT || 0; window.__AA_CLICK_COUNT = 0; const d = window.__AA_DIAG || []; window.__AA_DIAG = []; return { alive: !!window.__AA_PAUSED || (!!window.__AA_OBSERVER_ACTIVE && (Date.now() - (window.__AA_LAST_SCAN || 0)) < 120000), clickCount: c, diag: d }; })()',
-                        returnByValue: true
-                    }, sessionId);
+            // Health check existing sessions
+            if (this.sessions.size === 0) { this._heartbeatRunning = false; return; }
+
+            const entries = [...this.sessions.entries()];
+            const results = await Promise.allSettled(
+                entries.map(async ([targetId, info]) => {
+                    const check = await this._workerEval(info.wsUrl,
+                        '(() => { const c = window.__AA_CLICK_COUNT || 0; window.__AA_CLICK_COUNT = 0; const d = window.__AA_DIAG || []; window.__AA_DIAG = []; return { alive: !!window.__AA_PAUSED || (!!window.__AA_OBSERVER_ACTIVE && (Date.now() - (window.__AA_LAST_SCAN || 0)) < 120000), clickCount: c, diag: d }; })()'
+                    );
                     const health = check.result?.result?.value || { alive: false, clickCount: 0, diag: null };
-                    return { targetId, sessionId, alive: health.alive, clickCount: health.clickCount, diag: health.diag };
+                    return { targetId, alive: health.alive, clickCount: health.clickCount, diag: health.diag };
                 })
             );
 
-            const deadSessions = [];
-            for (let i = 0; i < healthResults.length; i++) {
-                const { status, value, reason } = healthResults[i];
-                const targetId = sessionEntries[i][0];
-                const sessionId = sessionEntries[i][1];
+            const dead = [];
+            for (let i = 0; i < results.length; i++) {
+                const { status, value } = results[i];
+                const targetId = entries[i][0];
+                const info = entries[i][1];
                 const shortId = targetId.substring(0, 6);
 
                 if (status === 'fulfilled') {
-                    // Reset consecutive fail counter on any successful communication
                     this._sessionFailCounts.delete(targetId);
+                    if (this.onClickTelemetry && value.clickCount > 0) this.onClickTelemetry(value.clickCount);
 
-                    // Harvest click telemetry from consume-and-reset
-                    if (this.onClickTelemetry && value.clickCount > 0) {
-                        this.onClickTelemetry(value.clickCount);
-                    }
-
-                    // Surface observer diagnostics in output panel
                     if (value.diag && Array.isArray(value.diag) && value.diag.length > 0) {
                         for (const d of value.diag) {
-                            if (d.action === 'BLOCKED') {
-                                this.log(`[DIAG] [${shortId}] BLOCKED | matched=${d.matched} | cmd=${d.cmd || 'N/A'}`);
-                            } else if (d.action === 'CIRCUIT_BREAKER') {
-                                this.log(`[DIAG] [${shortId}] ⚠️ CIRCUIT BREAKER | matched=${d.matched} | retries=${d.count} in 60s — auto-retry paused`);
-                            } else if (d.action === 'SKIP_DISABLED') {
-                                this.log(`[DIAG] [${shortId}] SKIP_DISABLED | matched=${d.matched} | tag=${d.tag || '?'} | text=${d.text || ''}`);
-                            } else if (d.action === 'SKIP_COOLDOWN') {
-                                this.log(`[DIAG] [${shortId}] SKIP_COOLDOWN | matched=${d.matched} | remaining=${d.remaining || '?'}`);
-                            } else if (d.action === 'CLICKED') {
-                                this.log(`[DIAG] [${shortId}] CLICKED | matched=${d.matched} | cmd=${d.cmd || 'N/A'} | url=${d.url || 'N/A'} | near=${(d.near || '').substring(0, 60)}`);
-                            } else {
-                                this.log(`[DIAG] [${shortId}] ${d.action} | ${JSON.stringify(d).substring(0, 100)}`);
-                            }
+                            if (d.action === 'BLOCKED') this.log(`[DIAG] [${shortId}] BLOCKED | matched=${d.matched} | cmd=${d.cmd || 'N/A'}`);
+                            else if (d.action === 'CIRCUIT_BREAKER') this.log(`[DIAG] [${shortId}] ⚠️ CIRCUIT BREAKER | matched=${d.matched} | retries=${d.count}`);
+                            else if (d.action === 'CLICKED') this.log(`[DIAG] [${shortId}] CLICKED | matched=${d.matched} | cmd=${d.cmd || 'N/A'} | near=${(d.near || '').substring(0, 60)}`);
+                            else this.log(`[DIAG] [${shortId}] ${d.action} | ${JSON.stringify(d).substring(0, 100)}`);
                         }
                     }
 
                     if (!value.alive) {
                         this.log(`[CDP] Session [${shortId}] observer dead, re-injecting...`);
-                        // Reset guard (isolated — ignore failures)
                         try {
-                            await this._send('Runtime.evaluate', {
-                                expression: 'window.__AA_OBSERVER_ACTIVE = false; "reset"'
-                            }, sessionId);
-                        } catch (e) { /* context may be gone — safe to ignore */ }
-                        try {
-                            const result = await this._injectObserver(sessionId);
-                            // Fast-fail: context changed to non-agent-panel — evict immediately
+                            const script = buildDOMObserverScript(
+                                this.getCustomTexts(), this.blockedCommands, this.allowedCommands, this.autoAcceptFileEdits
+                            );
+                            const msg = await this._workerBurstInject(info.wsUrl, targetId, script, this.isPaused);
+                            const result = msg.result || 'unknown';
                             if (result === 'not-agent-panel') {
-                                deadSessions.push({ targetId, sessionId });
-                                this._sessionFailCounts.delete(targetId);
-                                this.ignoredTargets.add(targetId);
-                                this.log(`[CDP] Session [${shortId}] is no longer agent panel, evicting`);
+                                dead.push(targetId); this.ignoredTargets.add(targetId);
                             } else if (result !== 'observer-installed' && result !== 'already-active') {
-                                // Soft failure (undefined, script error) — count toward pruning
-                                const failCount = (this._sessionFailCounts.get(targetId) || 0) + 1;
-                                this._sessionFailCounts.set(targetId, failCount);
-                                this.log(`[CDP] Re-inject [${shortId}] → ${result} (fail ${failCount}/3)`);
-                                if (failCount >= 3) {
-                                    deadSessions.push({ targetId, sessionId });
-                                    this._sessionFailCounts.delete(targetId);
-                                }
+                                const fc = (this._sessionFailCounts.get(targetId) || 0) + 1;
+                                this._sessionFailCounts.set(targetId, fc);
+                                if (fc >= 3) dead.push(targetId);
                             } else {
                                 this._sessionFailCounts.delete(targetId);
-                                this.log(`[CDP] ✓ Heartbeat re-injected [${shortId}] → ${result}`);
+                                this.log(`[CDP] ✓ Re-injected [${shortId}] → ${result}`);
                             }
                         } catch (e) {
-                            const failCount = (this._sessionFailCounts.get(targetId) || 0) + 1;
-                            this._sessionFailCounts.set(targetId, failCount);
-                            this.log(`[CDP] Heartbeat re-inject exception [${shortId}]: ${e.message} (fail ${failCount}/3)`);
-                            if (failCount >= 3) {
-                                deadSessions.push({ targetId, sessionId });
-                                this._sessionFailCounts.delete(targetId);
-                            }
+                            const fc = (this._sessionFailCounts.get(targetId) || 0) + 1;
+                            this._sessionFailCounts.set(targetId, fc);
+                            if (fc >= 3) dead.push(targetId);
                         }
                     }
                 } else {
-                    // Session unreachable — track consecutive failures
-                    const failCount = (this._sessionFailCounts.get(targetId) || 0) + 1;
-                    this._sessionFailCounts.set(targetId, failCount);
-                    if (failCount >= 3) {
-                        deadSessions.push({ targetId, sessionId });
-                        this._sessionFailCounts.delete(targetId);
-                        this.log(`[CDP] Session [${shortId}] unreachable 3x consecutively, pruning`);
-                    }
+                    const fc = (this._sessionFailCounts.get(targetId) || 0) + 1;
+                    this._sessionFailCounts.set(targetId, fc);
+                    if (fc >= 3) { dead.push(targetId); this.log(`[CDP] Session [${shortId}] unreachable 3x, pruning`); }
                 }
             }
 
-            // Prune dead sessions with clean detach
-            for (const { targetId, sessionId } of deadSessions) {
-                try {
-                    await this._send('Target.detachFromTarget', { sessionId });
-                } catch (e) { /* already detached — ignore */ }
-                this.sessions.delete(targetId);
+            for (const tid of dead) {
+                this.sessions.delete(tid);
+                this.sessionUrls.delete(tid);
+                this._sessionFailCounts.delete(tid);
             }
-        } catch (e) {
-            // Connection probably dead — onClose will trigger reconnect
-        }
+        } catch (e) { } finally { this._heartbeatRunning = false; }
     }
 
-    // ─── Port Discovery ───────────────────────────────────────────────
+    // ─── Port & Target Discovery (HTTP only — no WebSocket) ───────────
 
     _pingPort(port) {
         return new Promise((resolve) => {
             const req = http.get({ hostname: '127.0.0.1', port, path: '/json/version', timeout: 800 }, (res) => {
-                res.on('data', () => { });
+                res.on('data', () => {});
                 res.on('end', () => resolve(true));
             });
             req.on('error', () => resolve(false));
@@ -821,58 +457,30 @@ class ConnectionManager {
         });
     }
 
-    _getBrowserWsUrl(port) {
-        return new Promise((resolve, reject) => {
-            const req = http.get({ hostname: '127.0.0.1', port, path: '/json/version', timeout: 800 }, (res) => {
+    _getTargetList(port) {
+        return new Promise((resolve) => {
+            const req = http.get({ hostname: '127.0.0.1', port, path: '/json', timeout: 2000 }, (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
-                    try {
-                        const info = JSON.parse(data);
-                        resolve(info.webSocketDebuggerUrl || null);
-                    } catch (e) { reject(e); }
+                    try { resolve(JSON.parse(data)); } catch (e) { resolve(null); }
                 });
             });
-            req.on('error', reject);
-            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+            req.on('error', () => resolve(null));
+            req.on('timeout', () => { req.destroy(); resolve(null); });
         });
     }
 
     async _findActivePort() {
-        // Try cached port first
-        if (this.activeCdpPort && await this._pingPort(this.activeCdpPort)) {
-            return this.activeCdpPort;
-        }
-
+        if (this.activeCdpPort && await this._pingPort(this.activeCdpPort)) return this.activeCdpPort;
         const configPort = this.getPort();
-        if (await this._pingPort(configPort)) {
-            this.activeCdpPort = configPort;
-            return configPort;
-        }
-
+        if (await this._pingPort(configPort)) { this.activeCdpPort = configPort; return configPort; }
         return null;
     }
 
-    // ─── Cleanup Helpers ──────────────────────────────────────────────
-
-    _closeWebSocket() {
-        if (this.ws) {
-            // Strip all listeners before closing to prevent ghost close events
-            // from corrupting state after a new connection is established
-            this.ws.removeAllListeners();
-            try { this.ws.close(); } catch (e) {
-                this.log(`[CDP] WS close error: ${e.message}`);
-            }
-            this.ws = null;
-        }
-    }
-
-    _clearPending() {
-        for (const [id, handler] of this.pending) {
-            clearTimeout(handler.timer);
-        }
-        this.pending.clear();
-    }
+    // ─── Compat Shims ─────────────────────────────────────────────────
+    _closeWebSocket() { }
+    _clearPending() { }
 }
 
 module.exports = { ConnectionManager };

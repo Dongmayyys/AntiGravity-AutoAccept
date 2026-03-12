@@ -1,6 +1,6 @@
-// AntiGravity AutoAccept v3.9.2
+// AntiGravity AutoAccept v3.0.0
 // Primary: VS Code Commands API with async lock
-// Secondary: Child-process CDP sessions with MutationObserver injection
+// Secondary: Persistent CDP sessions with MutationObserver injection
 
 const vscode = require('vscode');
 const cp = require('child_process');
