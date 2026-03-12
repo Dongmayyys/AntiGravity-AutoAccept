@@ -32,7 +32,7 @@
                 "autoAcceptV2.pollInterval": {
                     "type": "number",
                     "default": 500,
-                    "scope": "window",
+                    "scope": "application",
                     "description": "Polling interval in milliseconds"
                 },
                 "autoAcceptV2.customButtonTexts": {
@@ -47,13 +47,13 @@
                 "autoAcceptV2.cdpPort": {
                     "type": "number",
                     "default": 9333,
-                    "scope": "machine",
+                    "scope": "application",
                     "description": "The localhost port for Chrome DevTools Protocol. (Default 9333 avoids conflicts with AG Browser Control)."
                 },
                 "autoAcceptV2.autoAcceptFileEdits": {
                     "type": "boolean",
-                    "default": true,
-                    "scope": "window",
+                    "default": false,
+                    "scope": "application",
                     "description": "Auto-accept file edits (acceptAgentStep). Set to false to review diffs before accepting."
                 },
                 "autoAcceptV2.blockedCommands": {
@@ -84,6 +84,7 @@
         }
     },
     "scripts": {
+        "deploy": "node scripts/deploy.js",
         "package": "npx -y @vscode/vsce package",
         "test": "echo \"Error: no test specified\" && exit 1"
     },
