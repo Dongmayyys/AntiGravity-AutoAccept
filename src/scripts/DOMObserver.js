@@ -23,7 +23,12 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
         'retry', 'continue',
         ...customTexts
     ];
-    const expandTexts = ['expand', 'requires input'];
+    // Issue #36 fix: 'expand' REMOVED from auto-click.
+    // Clicking Expand during browser subagent startup opens the trajectory
+    // modal whose state contains TypedArray screenshot data. AG IDE's state
+    // management (Pin/Krt in workbench.desktop.main.js) deep-freezes this
+    // state, throwing "Cannot freeze array buffer views with elements".
+    const expandTexts = ['requires input'];
 
     return `
 (function() {
@@ -194,10 +199,12 @@ function buildDOMObserverScript(customTexts, blockedCommands, allowedCommands, a
                 } else {
                     isMatch = nodeText === text ||
                         (text.length >= 5 && nodeText.startsWith(text) && isWordBoundary(nodeText, text.length) && nodeText.length <= text.length * 3) ||
-                        (nodeText.startsWith(text + ' ') && nodeText.length <= text.length * 5) ||
+                        // Prefix+space: for short keywords (< 5 chars like "run"), only allow very short
+                        // suffixes to prevent false positives on menu items ("Run Task...", "Run Active File")
+                        (nodeText.startsWith(text + ' ') && nodeText.length <= (text.length < 5 ? text.length + 4 : text.length * 5)) ||
                         // Keyboard shortcut suffix: Antigravity renders "AcceptAlt+⏎" with no space.
                         // The word boundary check fails because 'a' (from 'alt') is a word char.
-                        (text.length >= 5 && nodeText.startsWith(text) && nodeText.length <= text.length * 5 &&
+                        (text.length >= 3 && nodeText.startsWith(text) && nodeText.length <= text.length + 12 &&
                             /^(alt|ctrl|shift|cmd|meta|⌘|⌥|⇧|⌃)/.test(nodeText.substring(text.length)));
                 }
                 if (!isMatch) continue;

@@ -1,12 +1,24 @@
 # Changelog
 
-## [3.8.2] — 2026-03-12
+## [3.9.3] — 2026-03-12
+
+### Bug Fix — Issue #36 (Browser Sub-Agent Crash, TRUE Root Cause)
+- **Root cause identified**: The "Cannot freeze array buffer views with elements" crash was NOT caused by WebSocket architecture or CDP session conflicts. It was caused by the MutationObserver **clicking the "Expand" button** during browser sub-agent startup, which opened the `BROWSER_SUBAGENT_TRAJECTORY` modal. The modal's state contains TypedArray screenshot data that AG IDE's state management (`Pin`/`Krt` in `workbench.desktop.main.js`) tried to deep-freeze — triggering the crash in the **renderer process** (not extension host).
+- **Fixed**: Removed `'expand'` from the auto-click keyword list in `DOMObserver.js`. The "Expand" button is no longer auto-clicked, preventing the trajectory modal from opening prematurely during browser sub-agent initialization.
+- **Reverted** all unnecessary architecture changes from v3.8.3–v3.9.2 (per-target WebSocket, burst mode, child process isolation, Object.freeze interceptor) since the crash was in the renderer process, not the extension host.
+
+### Bug Fix — False Positive "Run" Clicks
+- **Fixed**: The MutationObserver was clicking terminal menu items like "Run Task..." and "Run Active File" because the keyword `'run'` with prefix+space matching allowed any text starting with "run " up to 15 chars. Tightened matching for short keywords (< 5 chars) to allow at most `keyword + 4` chars total, preventing menu item false positives while still matching "Run" and "RunAlt+⏎".
+- **Fixed**: Keyboard shortcut suffix matching now works for short keywords too (lowered threshold from `length >= 5` to `length >= 3`).
+
+---
+
+## [3.8.3] — 2026-03-12
 
 ### Bug Fix — Issue #36 (Browser Sub-Agent Crash, Root Cause)
-- **Fixed** "Cannot freeze array buffer views with elements" crash when using the AG browser sub-agent. The v3.8.0 fix (target URL filter) only addressed the surface — the real conflict was at three deeper levels:
+- **Fixed** "Cannot freeze array buffer views with elements" crash when using the AG browser sub-agent. The v3.8.0 fix (target URL filter) only addressed the surface — the real conflict was at two deeper levels:
   1. **Whitelist target filter**: Switched `_isCandidate` from a blacklist (skip `http://`/`https://`) to a whitelist (only attach to `vscode-webview://` URLs). The blacklist leaked `about:blank` targets created by the browser sub-agent before navigation.
   2. **Removed `Target.setDiscoverTargets`**: Subscribing to target lifecycle events broadcast them to ALL CDP clients sharing the Electron debug port, interfering with AG's internal browser sub-agent target management. Now relies solely on heartbeat polling (`Target.getTargets`).
-  3. **Browser sub-agent auto-pause**: Heartbeat now detects `http://`/`https://` page targets and automatically yields the CDP port by disconnecting — prevents ArrayBuffer serialization conflicts between competing CDP sessions.
 
 ### Performance
 - **Reduced** heartbeat interval from 30s to 10s to compensate for removing real-time target discovery events. New webview targets are now discovered within 10s instead of 30s.
