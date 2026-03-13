@@ -569,13 +569,6 @@ function activate(context) {
     context.subscriptions.push(statusBarItem);
     statusBarItem.show();
 
-    // Dashboard button in status bar — right next to the toggle
-    const dashboardStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
-    dashboardStatusBar.text = '$(dashboard) Dashboard';
-    dashboardStatusBar.command = 'autoAcceptV2.dashboard';
-    dashboardStatusBar.tooltip = 'Open AutoAccept Dashboard';
-    context.subscriptions.push(dashboardStatusBar);
-    dashboardStatusBar.show();
 
     context.subscriptions.push(
         vscode.commands.registerCommand('autoAcceptV2.toggle', () => {
