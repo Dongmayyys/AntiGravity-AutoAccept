@@ -9,8 +9,8 @@
  *   3. Verify deployed artifact
  *
  * Note: AutoAccept is pure JS — no build step needed.
- * The install directory name stays fixed (3.4.0) to avoid
- * editing Antigravity's extensions.json registry.
+ * Reads extensions.json to find the active install directory,
+ * so it works regardless of marketplace version updates.
  */
 
 const fs = require('fs');
@@ -23,9 +23,50 @@ const os = require('os');
 const ROOT = path.resolve(__dirname, '..');
 const pkg = require(path.join(ROOT, 'package.json'));
 
-// Fixed directory name — changing it requires editing extensions.json
-const INSTALL_DIR_NAME = 'yazanbaker.antigravity-autoaccept-3.4.0';
-const DEST = path.join(os.homedir(), '.antigravity', 'extensions', INSTALL_DIR_NAME);
+const EXTENSIONS_DIR = path.join(os.homedir(), '.antigravity', 'extensions');
+const EXTENSIONS_JSON = path.join(EXTENSIONS_DIR, 'extensions.json');
+
+/**
+ * Auto-detect the active install directory from extensions.json.
+ * Falls back to scanning the extensions folder if registry not found.
+ */
+function resolveInstallDir() {
+    // Strategy 1: Read extensions.json registry (source of truth)
+    if (fs.existsSync(EXTENSIONS_JSON)) {
+        try {
+            const registry = JSON.parse(fs.readFileSync(EXTENSIONS_JSON, 'utf8'));
+            const entry = registry.find(e =>
+                e.identifier?.id === 'yazanbaker.antigravity-autoaccept'
+            );
+            if (entry?.relativeLocation) {
+                console.log(`  📍 Found in extensions.json: ${entry.relativeLocation}`);
+                return entry.relativeLocation;
+            }
+        } catch (e) {
+            console.warn(`  ⚠ Failed to parse extensions.json: ${e.message}`);
+        }
+    }
+
+    // Strategy 2: Find newest matching directory
+    if (fs.existsSync(EXTENSIONS_DIR)) {
+        const dirs = fs.readdirSync(EXTENSIONS_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory() && d.name.startsWith('yazanbaker.antigravity-autoaccept-'))
+            .map(d => ({ name: d.name, mtime: fs.statSync(path.join(EXTENSIONS_DIR, d.name)).mtimeMs }))
+            .sort((a, b) => b.mtime - a.mtime);
+        if (dirs.length > 0) {
+            console.log(`  📍 Fallback: newest directory: ${dirs[0].name}`);
+            return dirs[0].name;
+        }
+    }
+
+    // Strategy 3: Default
+    const fallback = `yazanbaker.antigravity-autoaccept-${pkg.version}`;
+    console.log(`  📍 Fallback: using version from package.json: ${fallback}`);
+    return fallback;
+}
+
+const INSTALL_DIR_NAME = resolveInstallDir();
+const DEST = path.join(EXTENSIONS_DIR, INSTALL_DIR_NAME);
 
 const COPY_DIRS = ['src', 'images'];
 const COPY_FILES = ['package.json'];
